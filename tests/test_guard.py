@@ -200,6 +200,22 @@ class CycleTests(unittest.TestCase):
         terminate.assert_not_called()
         self.assertIn("disk full", report["actions"][0]["error"])
 
+    def test_final_cpu_burst_prevents_signal(self):
+        self.cycle(1000)
+        fresh = self.table | {101: dataclasses.replace(self.table[101], ticks=10000)}
+        with patch.object(g, "process_table", side_effect=[self.table, fresh]), patch.object(g, "terminate_scope") as terminate:
+            report = self.cycle(1031, True)
+        terminate.assert_not_called()
+        self.assertIn("CPU-active", report["actions"][0]["error"])
+
+    def test_one_scheduler_tick_does_not_block_idle_reclamation(self):
+        self.cycle(1000)
+        fresh = self.table | {101: dataclasses.replace(self.table[101], ticks=11)}
+        with patch.object(g, "process_table", side_effect=[self.table, fresh]), patch.object(g, "terminate_scope", return_value={"status": "hibernated"}) as terminate:
+            report = self.cycle(1031, True)
+        terminate.assert_called_once()
+        self.assertEqual(report["actions"][0]["action"], "hibernate")
+
     def test_focus_race_aborts(self):
         self.cycle(1000)
         original = self.call

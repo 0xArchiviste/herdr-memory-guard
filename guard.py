@@ -402,6 +402,7 @@ class Guard:
         snapshot = self.api.call("session.snapshot")["snapshot"]
         agents = {a["pane_id"]: a for a in snapshot.get("agents", [])}
         table = process_table()
+        table_sampled_at = time.monotonic()
         records, coordinators = project_records(cfg["projects_root"], self.api.path)
         memory = memory_sample(cfg, state)
         observations, candidates, skipped = {}, [], Counter()
@@ -452,6 +453,7 @@ class Guard:
                 seed = min(now, max(parse_time(record.get("last_state_change")) or now,
                                     parse_time(record.get("updated")) or now))
             observation = {"fingerprint": fingerprint, "activity": activity(pane), "ticks": ticks, "at": now,
+                           "cpu_sampled_at": table_sampled_at,
                            "quiet_since": prior["quiet_since"] if quiet else now,
                            "idle_since": prior["idle_since"] if continuous else seed,
                            "samples": prior.get("samples", 0) + 1 if quiet else 1}
@@ -529,7 +531,12 @@ class Guard:
             fresh_roots = [info["shell_pid"]]
         if fresh_roots != roots or {(p.pid, p.start) for p in fresh_scope.values()} != {(p.pid, p.start) for p in scope.values()}:
             raise GuardError("Process tree changed")
-        if any(fresh_scope[p.pid].ticks != p.ticks for p in scope.values()):
+        elapsed = max(0.01, time.monotonic() - observation["cpu_sampled_at"])
+        delta_ticks = sum(max(0, fresh_scope[p.pid].ticks - p.ticks) for p in scope.values())
+        # One scheduler tick of quantization slack, then the SAME quiet CPU
+        # ceiling as observation. Normal idle CLI housekeeping is not zero CPU.
+        allowed_ticks = 1 + elapsed * os.sysconf("SC_CLK_TCK") * latest_cfg["max_cpu_percent"] / 100
+        if delta_ticks > allowed_ticks:
             raise GuardError("Processes became CPU-active during final validation")
         checkpoint = self.checkpoint(candidate, pane, record, scope, server, cfg)
         # Check again after checkpoint I/O and reading terminal output.
