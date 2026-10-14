@@ -1,0 +1,57 @@
+id = "0xarchiviste.herdr-memory-guard"
+name = "Memory Guard"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+description = "Reclaim long-idle agent memory, preserve resumable sessions, and retire empty resolved panes. Linux and WSL."
+platforms = ["linux"]
+
+[[startup]]
+command = ["python3", "guard.py", "start"]
+
+[[actions]]
+id = "start"
+title = "Memory Guard: start monitor"
+contexts = ["global", "workspace"]
+command = ["python3", "guard.py", "start"]
+
+[[actions]]
+id = "enable"
+title = "Memory Guard: enable automatic reclamation"
+contexts = ["global", "workspace"]
+command = ["python3", "guard.py", "enable"]
+
+[[actions]]
+id = "pause"
+title = "Memory Guard: pause automatic reclamation"
+contexts = ["global", "workspace"]
+command = ["python3", "guard.py", "pause"]
+
+[[actions]]
+id = "stop"
+title = "Memory Guard: stop monitor"
+contexts = ["global", "workspace"]
+command = ["python3", "guard.py", "stop"]
+
+[[actions]]
+id = "status"
+title = "Memory Guard: show status"
+contexts = ["global", "workspace"]
+command = ["python3", "guard.py", "status"]
+
+[[actions]]
+id = "protect"
+title = "Memory Guard: protect this pane"
+contexts = ["pane"]
+command = ["python3", "guard.py", "protect"]
+
+[[actions]]
+id = "unprotect"
+title = "Memory Guard: unprotect this pane"
+contexts = ["pane"]
+command = ["python3", "guard.py", "unprotect"]
+
+[[actions]]
+id = "resume"
+title = "Memory Guard: resume this hibernated agent"
+contexts = ["pane"]
+command = ["python3", "guard.py", "resume"]

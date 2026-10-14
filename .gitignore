@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.coverage
+.venv/
+state/
+config.json
+checkpoints/
