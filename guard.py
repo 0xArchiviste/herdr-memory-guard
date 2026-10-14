@@ -42,7 +42,7 @@ DEFAULTS = {
     "host_available_percent": 15,
     "host_recovery_percent": 20,
     "psi_some_avg10": 10,
-    "max_cpu_percent": 1,
+    "max_cpu_percent": 2,
     "projects_root": "~/.herdr-projects",
     "managed_threads_only": True,
     "protect_coordinators": True,
@@ -265,7 +265,9 @@ def identity(pane):
 
 
 def activity(pane):
-    return [pane.get("revision"), pane.get("state_change_seq"), pane.get("agent_status")]
+    # Pane revisions also change on metadata, resizing, and UI bookkeeping.
+    # AgentInfo state sequences and passive terminal contents track actual activity.
+    return [pane.get("state_change_seq"), pane.get("agent_status"), pane.get("_screen_digest")]
 
 
 def resume_args(kind, session):
@@ -372,14 +374,33 @@ class Guard:
         with self.locked():
             return self._cycle(apply)
 
+    def observe_pane(self, pane, agent=None):
+        pane = dict(pane)
+        if pane.get("agent"):
+            if agent is None:
+                agent = self.api.call("agent.get", target=pane["pane_id"])["agent"]
+            if identity(agent) != identity(pane):
+                raise GuardError("Agent changed while observing pane")
+            if agent.get("agent_status") != pane.get("agent_status"):
+                raise GuardError("Pane became active or status changed while observing")
+            focused = bool(pane.get("focused") or agent.get("focused"))
+            pane.update(agent)
+            pane["focused"] = focused
+        read = self.api.call("pane.read", pane_id=pane["pane_id"], source="detection", lines=80, strip_ansi=True)["read"]
+        if not isinstance(read.get("text"), str):
+            raise GuardError("Passive terminal content unavailable")
+        pane["_screen_digest"] = hashlib.sha256(read["text"].encode()).hexdigest()
+        return pane
+
     def _cycle(self, apply):
         cfg = config_load(self.config_path)
         now = time.time()
         server = self.api.server_identity()
         state = read_json(self.state_path)
-        if state.get("server") != server:
-            state = {"server": server, "observations": {}}
+        if state.get("server") != server or state.get("observation_version") != 2:
+            state = {"server": server, "observation_version": 2, "observations": {}}
         snapshot = self.api.call("session.snapshot")["snapshot"]
+        agents = {a["pane_id"]: a for a in snapshot.get("agents", [])}
         table = process_table()
         records, coordinators = project_records(cfg["projects_root"], self.api.path)
         memory = memory_sample(cfg, state)
@@ -400,6 +421,7 @@ class Guard:
                 continue
             try:
                 info = self.api.call("pane.process_info", pane_id=pid)["process_info"]
+                pane = self.observe_pane(pane, agents.get(pid))
             except (GuardError, OSError):
                 skipped["process info unavailable"] += 1
                 continue
@@ -466,6 +488,9 @@ class Guard:
                     state["observations"].pop(c["pane_id"], None)
                 except (GuardError, OSError, ValueError) as exc:
                     report["actions"].append({"pane_id": c["pane_id"], "error": str(exc)})
+                    # Reobserve a raced/failed candidate before retrying, letting other
+                    # candidates progress instead of starving behind the largest one.
+                    state["observations"].pop(c["pane_id"], None)
         atomic_json(self.state_path, state)
         atomic_json(self.status_path, report)
         return report
@@ -482,7 +507,7 @@ class Guard:
         records, latest_coordinators = project_records(cfg["projects_root"], self.api.path)
         if records.get(pid) != record:
             raise GuardError("Project record changed")
-        current = self.api.call("pane.get", pane_id=pid)["pane"]
+        current = self.observe_pane(self.api.call("pane.get", pane_id=pid)["pane"])
         if identity(current) != identity(pane) or activity(current) != activity(pane):
             raise GuardError("Pane became active or its occupant changed")
         if current.get("focused") or pid in latest_cfg["protected_panes"] or (record or {}).get("project") in latest_cfg["protected_projects"]:
@@ -508,7 +533,7 @@ class Guard:
             raise GuardError("Processes became CPU-active during final validation")
         checkpoint = self.checkpoint(candidate, pane, record, scope, server, cfg)
         # Check again after checkpoint I/O and reading terminal output.
-        current = self.api.call("pane.get", pane_id=pid)["pane"]
+        current = self.observe_pane(self.api.call("pane.get", pane_id=pid)["pane"])
         if current.get("focused") or identity(current) != identity(pane) or activity(current) != activity(pane):
             raise GuardError("Pane changed while checkpointing; checkpoint retained")
         if candidate["action"] == "close-resolved-shell":
@@ -519,7 +544,7 @@ class Guard:
             result = {"pane_id": pid, "action": candidate["action"], "checkpoint": str(checkpoint)}
         else:
             def validate_before_signal():
-                final = self.api.call("pane.get", pane_id=pid)["pane"]
+                final = self.observe_pane(self.api.call("pane.get", pane_id=pid)["pane"])
                 if final.get("focused") or identity(final) != identity(pane) or activity(final) != activity(pane):
                     raise GuardError("Pane changed before signaling")
                 if not config_load(self.config_path)["enabled"]:
@@ -539,7 +564,9 @@ class Guard:
         files = list(directory.glob("*.json"))
         if len(files) >= cfg["max_checkpoints"] or sum(f.stat().st_size for f in files) >= cfg["checkpoint_limit_mib"] * MIB:
             raise GuardError("Checkpoint budget reached; preserve existing recovery records and stop reclaiming")
-        output = self.api.call("pane.read", pane_id=pane["pane_id"], source="recent_unwrapped", lines=200, strip_ansi=True)
+        # Visible reads are passive. Asking an idle CLI for application-owned
+        # history can scroll its UI and itself invalidate the quiet observation.
+        output = self.api.call("pane.read", pane_id=pane["pane_id"], source="visible", lines=200, strip_ansi=True)
         data = {"at": time.time(), "server": server, "socket": self.api.path,
                 "pane": pane, "thread": record, "terminal_output": output,
                 "processes": [dataclasses.asdict(p) for p in scope.values()], "decision": candidate}
@@ -570,6 +597,10 @@ class Guard:
                 raise GuardError("Pane/server was replaced; use the checkpoint's native resume arguments in the original working directory")
             if pane.get("agent"):
                 raise GuardError("Pane already has an agent")
+            cwd = pane.get("foreground_cwd") or pane.get("cwd")
+            original_cwd = original.get("foreground_cwd") or original.get("cwd")
+            if cwd != original_cwd:
+                raise GuardError("Working directory changed; return to the checkpoint's directory before resuming")
             info = self.api.call("pane.process_info", pane_id=pane_id)["process_info"]
             table = process_table()
             shell = table.get(info.get("shell_pid"))

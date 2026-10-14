@@ -17,7 +17,7 @@ Installation starts in observation mode. Enabling automatic reclamation is persi
 ## What it does
 
 * Samples Linux `MemAvailable`, memory pressure stalls, and, on WSL, Windows available physical memory. Swap use is reported, but old swap alone does not mean the machine is under current pressure.
-* Tracks idle agent process-tree RSS plus swap. This is an approximate budget: shared pages can be counted more than once.
+* Tracks idle agent process-tree RSS plus swap. This is an approximate budget: shared pages can be counted more than once. Quiet observations use actual terminal content and agent state sequences; routine Herdr metadata revisions do not count as agent activity.
 * Hibernates a supported agent after two hours idle, or 30 minutes when memory is under pressure or eligible idle agents exceed a 2 GiB budget. Every action also requires three minutes of continuously observed quiet output and low CPU activity. Herdr Projects timestamps can establish age; they never substitute for live quiet observation.
 * Writes a private, durable checkpoint with the native session ID, working directory, thread record, recent terminal output, and process identities before doing anything.
 * Sends SIGTERM to the verified foreground agent and its captured descendants, allowing the agent time to flush session data. It keeps the shell, pane, worktree, branches, files, and Herdr Projects records. It never sends SIGKILL, kills a process group, or kills the Herdr server. Survivors are reported as partial reclamation.
@@ -58,7 +58,7 @@ herdr plugin config-dir 0xarchiviste.herdr-memory-guard
 
 Only override settings you want to change; defaults are in `guard.py:DEFAULTS`. The `enable` action writes all defaults for convenience. Useful settings include `idle_seconds`, `pressure_idle_seconds`, `idle_budget_mib`, `max_actions_per_cycle`, `protected_panes`, and `protected_projects`. Unknown or malformed settings stop automatic actions. Setting `managed_threads_only` to false also admits supported idle agents outside Projects, but coordinator protection remains on by default.
 
-Linux pressure starts below 20% available memory and clears above 25%; Windows pressure starts below 15% and clears above 20%. Three actions are permitted per cycle. The monitor itself is limited by systemd to 128 MiB and 10% of one CPU, with a 30-second polling interval. Windows memory is sampled every two minutes. Process and checkpoint state are isolated by socket and server identity; server restart resets quiet observations.
+Linux pressure starts below 20% available memory and clears above 25%; Windows pressure starts below 15% and clears above 20%. Three actions are permitted per cycle. An idle process tree must stay below 2% of one CPU during quiet observation. The monitor itself is limited by systemd to 128 MiB and 10% of one CPU, with a 30-second polling interval. Windows memory is sampled every two minutes. Process and checkpoint state are isolated by socket and server identity; server restart resets quiet observations.
 
 State is stored in `HERDR_PLUGIN_STATE_DIR` when invoked through Herdr, otherwise `~/.local/state/herdr-memory-guard`. Each socket has a separate directory containing `status.json`, `state.json`, a bounded audit log, and `checkpoints/`. These files can contain private paths, terminal output, and session IDs. Directories are private and checkpoint files are mode 0600. They are never uploaded. The plugin makes no network requests.
 

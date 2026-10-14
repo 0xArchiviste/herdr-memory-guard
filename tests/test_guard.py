@@ -115,6 +115,7 @@ class CycleTests(unittest.TestCase):
         self.record = {"project": "demo", "id": "t-0001", "status": "open", "last_state": "idle",
                        "updated": "1970-01-01T00:00:01Z", "last_state_change": "1970-01-01T00:00:01Z"}
         self.api.call.side_effect = self.call
+        self.screen = "saved terminal history"
         self.guard = g.Guard(self.api, Path(self.temp.name) / "cfg", Path(self.temp.name) / "state")
         self.cfg = g.DEFAULTS | {"enabled": True, "quiet_seconds": 30, "idle_seconds": 120, "pressure_idle_seconds": 60}
         g.atomic_json(self.guard.config_path, self.cfg)
@@ -131,8 +132,10 @@ class CycleTests(unittest.TestCase):
             return {"process_info": self.info.copy()}
         if method == "pane.get":
             return {"pane": copy.deepcopy(self.pane)}
+        if method == "agent.get":
+            return {"agent": copy.deepcopy(self.pane)}
         if method == "pane.read":
-            return {"text": "saved terminal history"}
+            return {"read": {"text": self.screen}}
         return {}
 
     def cycle(self, now, apply=False):
@@ -159,10 +162,20 @@ class CycleTests(unittest.TestCase):
 
     def test_output_activity_resets_idle_and_quiet(self):
         self.cycle(1000)
-        self.pane["revision"] += 1
+        self.screen = "new output or draft"
         candidate = self.cycle(1031)["candidates"][0]
         self.assertEqual(candidate["quiet_seconds"], 0)
         self.assertEqual(candidate["idle_seconds"], 0)
+
+    def test_metadata_revision_does_not_reset_idle(self):
+        self.cycle(1000)
+        self.pane["revision"] += 1
+        self.assertTrue(self.cycle(1031)["candidates"][0]["ready"])
+
+    def test_agent_sequence_change_resets_idle(self):
+        self.cycle(1000)
+        self.pane["state_change_seq"] += 1
+        self.assertFalse(self.cycle(1031)["candidates"][0]["ready"])
 
     def test_cpu_activity_resets_quiet(self):
         self.cycle(1000)
@@ -208,6 +221,7 @@ class CycleTests(unittest.TestCase):
             report = self.cycle(1031, True)
         terminate.assert_not_called()
         self.assertIn("active", report["actions"][0]["error"])
+        self.assertNotIn("w1:p2", g.read_json(self.guard.state_path)["observations"])
 
     def test_resolved_shell_with_background_child_is_not_closed(self):
         self.pane = pane(agent=None, agent_status="unknown", agent_session=None)
@@ -235,6 +249,43 @@ class CycleTests(unittest.TestCase):
         terminate.assert_not_called()
         self.assertTrue((checkpoints / "old.json").exists())
         self.assertIn("budget", report["actions"][0]["error"])
+
+    def prepare_resume(self):
+        original = self.pane | {"cwd": "/example/worktree"}
+        g.atomic_json(self.guard.directory / "checkpoints/123-w1-p2.json", {
+            "pane": original, "server": "boot:1:1", "outcome": {"action": "hibernate"}})
+        self.pane = original | {"agent": None}
+        del self.table[101]
+        self.info["foreground_process_group_id"] = 100
+
+    def test_resume_uses_native_session_without_prompt(self):
+        self.prepare_resume()
+        self.guard.resume("w1:p2")
+        self.api.call.assert_any_call("agent.start", pane_id="w1:p2", kind="claude", name="worker",
+                                      args=["--resume", "12345678-abcd-1234"], timeout_ms=8000)
+        self.assertFalse(any(c.args[0] == "agent.prompt" for c in self.api.call.call_args_list))
+
+    def test_resume_refuses_replaced_server(self):
+        self.prepare_resume()
+        self.api.server_identity.return_value = "boot:2:2"
+        with self.assertRaisesRegex(g.GuardError, "replaced"):
+            self.guard.resume("w1:p2")
+
+    def test_resume_refuses_another_agent_or_busy_shell(self):
+        self.prepare_resume()
+        self.pane["agent"] = "claude"
+        with self.assertRaisesRegex(g.GuardError, "already"):
+            self.guard.resume("w1:p2")
+        self.pane["agent"] = None
+        self.table[101] = proc(101, 100, 101, "vim")
+        with self.assertRaisesRegex(g.GuardError, "empty interactive shell"):
+            self.guard.resume("w1:p2")
+
+    def test_resume_refuses_changed_worktree(self):
+        self.prepare_resume()
+        self.pane["cwd"] = "/another/worktree"
+        with self.assertRaisesRegex(g.GuardError, "directory changed"):
+            self.guard.resume("w1:p2")
 
 
 class SignalTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 id = "0xarchiviste.herdr-memory-guard"
 name = "Memory Guard"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.3"
 description = "Reclaim long-idle agent memory, preserve resumable sessions, and retire empty resolved panes. Linux and WSL."
 platforms = ["linux"]
