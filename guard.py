@@ -13,6 +13,8 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import signal
 import socket
 import struct
@@ -30,13 +32,12 @@ SHELLS = {"bash", "zsh", "fish", "sh", "dash"}
 DEFAULTS = {
     "enabled": False,
     "interval_seconds": 30,
-    "idle_seconds": 7200,
     "pressure_idle_seconds": 1800,
+    "recent_work_seconds": 3600,
     "quiet_seconds": 180,
     "resolved_shell_seconds": 86400,
     "max_actions_per_cycle": 3,
     "min_reclaim_mib": 64,
-    "idle_budget_mib": 2048,
     "available_percent": 20,
     "recovery_percent": 25,
     "host_available_percent": 15,
@@ -51,11 +52,44 @@ DEFAULTS = {
     "checkpoint_limit_mib": 256,
     "max_checkpoints": 1000,
     "sample_windows_host": True,
+    "close_resolved_shells": True,
+    "failure_backoff_seconds": 300,
+    "failure_backoff_max_seconds": 86400,
+    "notify_coordinators": True,
+    "herdr_projects_bin": "herdr-projects",
 }
+# Accepted so older config files still load, but they no longer do anything.
+DEPRECATED = {
+    "idle_seconds": "hibernation now requires real memory pressure; there is no idle-only timer",
+    "idle_budget_mib": "idle agents holding memory is not memory pressure",
+}
+# Herdr error codes that will not change by retrying with the same pane state.
+PERMANENT_CODES = {"confirmation_required"}
+# herdr-projects groups (src/thread.rs::group) whose thread is waiting on the user.
+WAITING_GROUPS = {"waiting-on-you": "waiting on you", "ready-for-review": "ready for review",
+                  "landing": "landing (approved pull request)"}
+ELIGIBLE_GROUPS = {"idle", "resolved"}
 
 
 class GuardError(RuntimeError):
-    pass
+    def __init__(self, message, permanent=False):
+        super().__init__(message)
+        self.permanent = permanent
+
+
+def fmt_duration(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+    return f"{seconds // 86400}d{seconds % 86400 // 3600}h"
+
+
+def fmt_percent(value):
+    return f"{value:.1f}".rstrip("0").rstrip(".") + "%"
 
 
 def atomic_json(path, data):
@@ -88,9 +122,9 @@ def read_json(path, default=None):
 
 def config_load(path):
     overrides = read_json(path)
-    if not isinstance(overrides, dict) or set(overrides) - set(DEFAULTS):
+    if not isinstance(overrides, dict) or set(overrides) - set(DEFAULTS) - set(DEPRECATED):
         raise GuardError("Invalid config or unknown setting; automatic actions stopped")
-    cfg = DEFAULTS | overrides
+    cfg = DEFAULTS | {k: v for k, v in overrides.items() if k not in DEPRECATED}
     for key, default in DEFAULTS.items():
         value = cfg[key]
         if isinstance(default, bool):
@@ -109,14 +143,21 @@ def config_load(path):
             raise GuardError(f"{key} must be below 100")
     if cfg["interval_seconds"] < 5 or cfg["quiet_seconds"] < 30:
         raise GuardError("Minimum interval is 5 seconds; minimum quiet observation is 30 seconds")
-    if cfg["pressure_idle_seconds"] > cfg["idle_seconds"]:
-        raise GuardError("pressure_idle_seconds must not exceed idle_seconds")
+    if not cfg["herdr_projects_bin"]:
+        raise GuardError("herdr_projects_bin must not be empty")
+    if cfg["failure_backoff_max_seconds"] < cfg["failure_backoff_seconds"]:
+        raise GuardError("failure_backoff_max_seconds must be at least failure_backoff_seconds")
     if cfg["recovery_percent"] < cfg["available_percent"] or cfg["host_recovery_percent"] < cfg["host_available_percent"]:
         raise GuardError("Recovery thresholds must be at least the pressure thresholds")
     for key in ("max_actions_per_cycle", "max_checkpoints"):
         if type(cfg[key]) is not int:
             raise GuardError(f"{key} must be an integer")
     return cfg
+
+
+def ignored_settings(path):
+    data = read_json(path)
+    return sorted(k for k in data if k in DEPRECATED) if isinstance(data, dict) else []
 
 
 class API:
@@ -135,7 +176,9 @@ class API:
                 raise GuardError("Oversize Herdr response")
         result = json.loads(line)
         if result.get("id") != request_id or "error" in result:
-            raise GuardError(f"Herdr {method} failed: {result.get('error', 'invalid response')}")
+            error = result.get("error", "invalid response")
+            code = error.get("code") if isinstance(error, dict) else None
+            raise GuardError(f"Herdr {method} failed: {error}", permanent=code in PERMANENT_CODES)
         return result["result"]
 
     def server_identity(self):
@@ -233,7 +276,8 @@ def parse_time(value):
 
 
 def project_records(root, socket_path):
-    records, coordinators = {}, set()
+    # coordinators: pane id -> project slug (membership tests work like a set).
+    records, coordinators = {}, {}
     root = Path(root).expanduser()
     for project in root.iterdir() if root.exists() else []:
         if not project.is_dir() or project.name.startswith("."):
@@ -243,7 +287,7 @@ def project_records(root, socket_path):
             if binding.get("socket") != socket_path:
                 continue
             if binding.get("pane_id"):
-                coordinators.add(binding["pane_id"])
+                coordinators[binding["pane_id"]] = project.name
             for file in (project / "threads").glob("*.toml"):
                 try:
                     record = tomllib.loads(file.read_text())
@@ -297,8 +341,10 @@ def protection(pane, record, coordinators, cfg):
         return "unmanaged"
     if record and (record.get("prompt_pending") or record.get("brief_claimed") or record.get("error") or record.get("brief_stuck")):
         return "thread requires attention"
+    if not pane.get("agent"):
+        return "no agent in pane"
     if pane.get("agent_status") not in SAFE_STATES:
-        return "working, blocked, or unknown"
+        return f"agent is {pane.get('agent_status') or 'in an unknown state'}"
     try:
         resume_args(pane.get("agent"), pane.get("agent_session") or {})
     except GuardError as exc:
@@ -334,18 +380,229 @@ def memory_sample(cfg, state):
             "psi_some_avg10": psi, "host_available_percent": host_percent}
 
 
-def pressure_level(memory, cfg, previous, idle_mib):
+def pressure_level(memory, cfg, previous):
+    """Genuine memory pressure only, each reason with its numbers and threshold.
+
+    While already under pressure the recovery thresholds apply (hysteresis).
+    Idle agents holding memory is not pressure: a machine with headroom keeps them.
+    """
     reasons = []
-    if memory["available_percent"] < cfg["recovery_percent" if previous else "available_percent"]:
-        reasons.append("Linux available memory")
+    linux = cfg["recovery_percent" if previous else "available_percent"]
+    if memory["available_percent"] < linux:
+        mib = memory.get("available_mib")
+        amount = f" ({mib} MiB)" if mib is not None else ""
+        reasons.append(f"Linux MemAvailable {fmt_percent(memory['available_percent'])}{amount} is below "
+                       f"{fmt_percent(linux)}" + (" (recovery threshold)" if previous else ""))
     host = memory.get("host_available_percent")
-    if host is not None and host < cfg["host_recovery_percent" if previous else "host_available_percent"]:
-        reasons.append("Windows available memory")
+    host_limit = cfg["host_recovery_percent" if previous else "host_available_percent"]
+    if host is not None and host < host_limit:
+        reasons.append(f"Windows host available memory {fmt_percent(host)} is below {fmt_percent(host_limit)}"
+                       + (" (recovery threshold)" if previous else ""))
     if memory["psi_some_avg10"] >= cfg["psi_some_avg10"]:
-        reasons.append("Linux memory stalls")
-    if idle_mib > cfg["idle_budget_mib"]:
-        reasons.append("idle agent memory budget")
+        reasons.append(f"Linux memory stall PSI some avg10 {memory['psi_some_avg10']:g} is at or above {cfg['psi_some_avg10']:g}")
     return reasons
+
+
+def headroom(memory, cfg):
+    parts = [f"Linux MemAvailable {fmt_percent(memory['available_percent'])}"
+             + (f" ({memory['available_mib']} MiB)" if memory.get("available_mib") is not None else "")
+             + f" >= {fmt_percent(cfg['available_percent'])}",
+             f"PSI some avg10 {memory['psi_some_avg10']:g} < {cfg['psi_some_avg10']:g}"]
+    if memory.get("host_available_percent") is not None:
+        parts.append(f"Windows host {fmt_percent(memory['host_available_percent'])} >= {fmt_percent(cfg['host_available_percent'])}")
+    return ", ".join(parts)
+
+
+def projects_bin(cfg):
+    name = cfg["herdr_projects_bin"]
+    found = shutil.which(name)
+    if not found and "/" not in name:
+        # systemd user services often lack ~/.local/bin on PATH.
+        local = Path.home() / ".local/bin" / name
+        if local.is_file() and os.access(local, os.X_OK):
+            found = str(local)
+    return found
+
+
+def thread_states(cfg, slugs):
+    """Live thread state from `herdr-projects thread list <slug> --json`, keyed by (project, thread id).
+
+    This is the same grouping herdr-projects shows the user (waiting on you,
+    ready for review, working, idle...). Failures are returned per project so
+    callers fail closed.
+    """
+    exe = projects_bin(cfg)
+    states, errors = {}, {}
+    for slug in sorted(slugs):
+        if not exe:
+            errors[slug] = f"{cfg['herdr_projects_bin']} not found"
+            continue
+        try:
+            out = subprocess.run([exe, "--root", str(Path(cfg["projects_root"]).expanduser()), "thread", "list", slug, "--json"],
+                                 capture_output=True, text=True, timeout=20, check=True)
+            data = json.loads(out.stdout)
+            if not isinstance(data, list):
+                raise ValueError("unexpected thread list output")
+            for thread in data:
+                if isinstance(thread, dict) and thread.get("id"):
+                    states[(slug, thread["id"])] = thread
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            errors[slug] = str(exc)[:200]
+    return states, errors
+
+
+def thread_hold(record, live, now, cfg):
+    """(rule, reason) when a managed thread's agent must stay, else ("", "")."""
+    if live is None:
+        return "thread state unavailable", "thread state unavailable from herdr-projects; failing closed"
+    group = live.get("group_token")
+    if group in WAITING_GROUPS:
+        return "waiting on the user", f"waiting on the user: thread is {WAITING_GROUPS[group]}"
+    if group == "working":
+        return "thread is working", "thread is working"
+    if group not in ELIGIBLE_GROUPS:
+        return "thread state unavailable", f"unrecognised thread group {group!r}; failing closed"
+    thread = record | live
+    if thread.get("status") != "resolved":
+        if thread.get("report_hash") and thread.get("report_hash") != thread.get("acked_report_hash"):
+            return "waiting on the user", "waiting on the user: unacknowledged report"
+        if str(thread.get("pr_state", "")).lower() == "open":
+            return "waiting on the user", "waiting on the user: open pull request"
+        if "waiting" in str(thread.get("activity", "")).lower():
+            return "waiting on the user", f"waiting on the user: agent reported {thread['activity']!r}"
+    stamps = [parse_time(thread.get(k)) for k in ("last_state_change", "last_report_change", "launched_at", "brief_seen_at")]
+    stamps = [s for s in stamps if s]
+    if stamps:
+        age = now - max(stamps)
+        if age < cfg["recent_work_seconds"]:
+            return "recently worked", (f"recently worked: last thread activity {fmt_duration(age)} ago "
+                                       f"(protected for {fmt_duration(cfg['recent_work_seconds'])})")
+    return "", ""
+
+
+def native_resume_command(kind, args, cwd):
+    command = shlex.join([kind, *args])
+    return f"cd {shlex.quote(cwd)} && {command}" if cwd else command
+
+
+def safe_subject(subject):
+    cleaned = "".join(c.lower() if c.isascii() and (c.isalnum() or c == "-") else "-" for c in subject)[:40].strip("-")
+    return cleaned or "item"
+
+
+def toml_string(value):
+    # JSON string escapes are a subset of TOML basic-string escapes.
+    return json.dumps(value, ensure_ascii=True)
+
+
+def write_inbox(projects_root, slug, subject, event, summary):
+    """Leave an item in a herdr-projects inbox, in its own file format (src/inbox.rs).
+
+    The herdr-projects ticker announces unseen items to the coordinator only
+    when it is idle and its input box is empty, so this never types into a busy agent.
+    """
+    project = Path(projects_root).expanduser() / slug
+    if not slug or "/" in slug or slug.startswith(".") or not (project / "PROJECT.md").is_file():
+        raise GuardError(f"Project {slug!r} not found for coordinator notification")
+    (project / "inbox").mkdir(exist_ok=True)
+    (project / ".state").mkdir(exist_ok=True)
+    with (project / ".state/lock").open("a") as lock:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise GuardError("herdr-projects project lock is busy")
+                time.sleep(0.05)
+        now = dt.datetime.now(dt.timezone.utc)
+        item_id = f"{now:%Y%m%dT%H%M%SZ}-memory-guard-{safe_subject(subject)}-mg{time.time_ns() % 10**12}"
+        clean = "".join(" " if ord(c) < 32 or ord(c) == 127 else c for c in summary)
+        front = "".join(f"{key} = {toml_string(value)}\n" for key, value in [
+            ("id", item_id), ("kind", "memory-guard"), ("subject", subject),
+            ("created", f"{now:%Y-%m-%dT%H:%M:%SZ}"), ("summary", clean), ("event", event)])
+        path = project / "inbox" / f"{item_id}.md"
+        fd, name = tempfile.mkstemp(prefix=".memory-guard-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w") as out:
+                out.write(f"+++\n{front}+++\n")
+            os.chmod(name, 0o644)
+            os.replace(name, path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+    return item_id
+
+
+def checkpoint_key(data):
+    pane = data.get("pane") or {}
+    session = pane.get("agent_session") or {}
+    return (pane.get("pane_id"), pane.get("terminal_id"), session.get("value"), (data.get("decision") or {}).get("action"))
+
+
+def checkpoint_succeeded(data):
+    outcome = data.get("outcome") or {}
+    return outcome.get("status") in {"hibernated", "partial", "closed"} or (
+        outcome.get("action") in {"hibernate", "close-resolved-shell"} and "error" not in outcome and outcome.get("status") != "aborted")
+
+
+def prune_checkpoints(directory, apply=False):
+    """Remove superseded duplicate checkpoints of attempts that changed nothing.
+
+    For each (pane, terminal, session, action) only the newest unsuccessful
+    attempt is kept, and none once a later attempt succeeded. Successful
+    hibernations and unreadable files are always kept.
+    """
+    groups = {}
+    for path in sorted(Path(directory).glob("*.json"), key=lambda p: (int(p.name.split("-")[0]) if p.name.split("-")[0].isdigit() else 0, p.name)):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            groups.setdefault(checkpoint_key(data), []).append((path, data))
+    remove = []
+    for items in groups.values():
+        last_success = max((i for i, (_, d) in enumerate(items) if checkpoint_succeeded(d)), default=-1)
+        failed = [i for i, (_, d) in enumerate(items) if not checkpoint_succeeded(d)]
+        for i in failed:
+            if i != failed[-1] or i < last_success:
+                remove.append(items[i][0])
+    if apply:
+        for path in remove:
+            path.unlink(missing_ok=True)
+    return {"remove": [str(p) for p in remove], "applied": apply}
+
+
+DECISION_ORDER = {"hibernated": 0, "closed": 0, "failed": 0, "ready": 1, "watching": 2, "backoff": 3, "protected": 4}
+
+
+def render(report):
+    """Human-readable dry-run output: one line per pane with its decision and reason."""
+    m = report["memory"]
+    host = "n/a" if m.get("host_available_percent") is None else fmt_percent(m["host_available_percent"])
+    lines = [f"Memory: Linux MemAvailable {fmt_percent(m['available_percent'])} ({m.get('available_mib', '?')} MiB), "
+             f"PSI some avg10 {m['psi_some_avg10']:g}, Windows host {host}, swap used {m.get('swap_used_mib', '?')} MiB",
+             "Pressure: " + ("; ".join(report["pressure"]) if report["pressure"] else f"none ({report['headroom']})"),
+             "Mode: " + ("apply" if report["apply"] and report["enabled"] else "dry run (no signals, no pane changes)")]
+    if report.get("ignored_settings"):
+        lines.append("Ignored settings: " + ", ".join(report["ignored_settings"]))
+    if report.get("thread_state_errors"):
+        lines.append("Thread state errors: " + "; ".join(f"{k}: {v}" for k, v in report["thread_state_errors"].items()))
+    lines.append(f"{len(report['decisions'])} panes ({report['agents']} agents); "
+                 f"protected by rule: " + ", ".join(f"{k} {v}" for k, v in sorted(report["protected"].items(), key=lambda kv: -kv[1])))
+    lines.append("")
+    lines.append(f"{'PANE':<10} {'DECISION':<10} {'THREAD':<32} {'AGENT':<16} REASON")
+    for d in sorted(report["decisions"], key=lambda d: (DECISION_ORDER.get(d["decision"], 9), d.get("project") or "", d["pane_id"])):
+        who = "/".join(x for x in (d.get("project"), d.get("thread")) if x) or "-"
+        agent = f"{d['agent']}({d.get('agent_status') or '?'})" if d.get("agent") else "-"
+        lines.append(f"{d['pane_id']:<10} {d['decision']:<10} {who:<32} {agent:<16} {d['reason']}")
+    for a in report["actions"]:
+        lines.append(f"ACTION {a['pane_id']} {a.get('action')}: " + (f"FAILED {a['error']}" if "error" in a else a.get("status", "done")))
+    for pid, h in sorted((report.get("hibernated") or {}).items()):
+        lines.append(f"HIBERNATED {pid} {h.get('project')}/{h.get('thread')}: resume with {h.get('resume_command')}")
+    return "\n".join(lines)
 
 
 def plugin_enabled(api):
@@ -397,16 +654,31 @@ class Guard:
         now = time.time()
         server = self.api.server_identity()
         state = read_json(self.state_path)
-        if state.get("server") != server or state.get("observation_version") != 2:
-            state = {"server": server, "observation_version": 2, "observations": {}}
+        if state.get("server") != server or state.get("observation_version") != 3:
+            state = {"server": server, "observation_version": 3, "observations": {}, "failures": {}}
+        state.setdefault("failures", {})
         snapshot = self.api.call("session.snapshot")["snapshot"]
         agents = {a["pane_id"]: a for a in snapshot.get("agents", [])}
         table = process_table()
         table_sampled_at = time.monotonic()
         records, coordinators = project_records(cfg["projects_root"], self.api.path)
         memory = memory_sample(cfg, state)
-        observations, candidates, skipped = {}, [], Counter()
-        scopes = {}
+        pressure = pressure_level(memory, cfg, state.get("pressure", False))
+        decisions, protected = {}, Counter()
+
+        def note(pane, record, decision, reason, rule=None):
+            tokens = pane.get("tokens") or {}
+            project = (record or {}).get("project") or tokens.get("hp_project")
+            if not project and isinstance(coordinators, dict):
+                project = coordinators.get(pane["pane_id"])
+            decisions[pane["pane_id"]] = {
+                "pane_id": pane["pane_id"], "project": project,
+                "thread": (record or {}).get("id"), "agent": pane.get("agent"), "agent_status": pane.get("agent_status"),
+                "decision": decision, "reason": reason}
+            if decision == "protected":
+                protected[rule or reason] += 1
+
+        admitted = []
         for pane in snapshot["panes"]:
             pid = pane["pane_id"]
             # Global focus is authoritative even if a PaneInfo omitted its flag.
@@ -414,30 +686,53 @@ class Guard:
                 pane = pane | {"focused": True}
             record = records.get(pid)
             reason = protection(pane, record, coordinators, cfg)
-            shell_candidate = (record and record.get("status") == "resolved" and not pane.get("agent")
-                               and not pane.get("focused") and pid not in cfg["protected_panes"]
-                               and record["project"] not in cfg["protected_projects"] and pid not in coordinators)
+            shell_candidate = bool(cfg["close_resolved_shells"] and record and record.get("status") == "resolved"
+                                   and not pane.get("agent") and not pane.get("focused") and pid not in cfg["protected_panes"]
+                                   and record["project"] not in cfg["protected_projects"] and pid not in coordinators)
             if reason and not shell_candidate:
-                skipped[reason] += 1
+                note(pane, record, "protected", reason)
+                continue
+            admitted.append((pane, record, shell_candidate))
+        slugs = {record["project"] for _, record, shell in admitted if record and not shell}
+        threads, thread_errors = thread_states(cfg, slugs) if slugs else ({}, {})
+
+        observations, candidates, scopes, signatures = {}, [], {}, {}
+        for pane, record, shell_candidate in admitted:
+            pid = pane["pane_id"]
+            live = threads.get((record["project"], record.get("id"))) if record else None
+            if record and not shell_candidate:
+                rule, hold = thread_hold(record, live, now, cfg)
+                if hold:
+                    note(pane, record, "protected", hold, rule)
+                    continue
+            signatures[pid] = failure_signature(pane, record, live)
+            failure = state["failures"].get(pid)
+            if failure and failure.get("signature") != signatures[pid]:
+                state["failures"].pop(pid)
+                failure = None
+            if failure and (failure.get("permanent") or now < failure["next_at"]):
+                wait = ("not retrying until the pane or thread changes" if failure.get("permanent")
+                        else f"next attempt in {fmt_duration(failure['next_at'] - now)}")
+                note(pane, record, "backoff", f"{failure['count']} failed attempt(s), last: {failure['error']}; {wait}", "backoff")
                 continue
             try:
                 info = self.api.call("pane.process_info", pane_id=pid)["process_info"]
                 pane = self.observe_pane(pane, agents.get(pid))
-            except (GuardError, OSError):
-                skipped["process info unavailable"] += 1
+            except (GuardError, OSError) as exc:
+                note(pane, record, "protected", f"process info unavailable: {str(exc)[:120]}", "process info unavailable")
                 continue
             if shell_candidate:
                 shell = table.get(info.get("shell_pid"))
                 tree = descendants(shell.pid, table) if shell else {}
                 if not shell or shell.name not in SHELLS or info.get("foreground_process_group_id") != shell.pgrp or len(tree) != 1:
-                    skipped["resolved pane has running processes"] += 1
+                    note(pane, record, "protected", "resolved pane has running processes")
                     continue
                 scope, roots, action = tree, [shell.pid], "close-resolved-shell"
             else:
                 scope, roots = process_scope(info, table, pane.get("agent"))
                 action = "hibernate"
                 if not scope:
-                    skipped["unverified foreground agent"] += 1
+                    note(pane, record, "protected", "unverified foreground agent")
                     continue
             fingerprint = [identity(pane), [[p.pid, p.start] for p in sorted(scope.values(), key=lambda p: p.pid)]]
             ticks = sum(p.ticks for p in scope.values())
@@ -465,37 +760,145 @@ class Guard:
                          "project": (record or {}).get("project"), "thread": (record or {}).get("id"),
                          "rss_mib": round(rss / MIB, 1), "swap_mib": round(swap / MIB, 1),
                          "idle_seconds": int(now - observation["idle_since"]),
-                         "quiet_seconds": int(now - observation["quiet_since"]), "ready": False}
+                         "quiet_seconds": int(now - observation["quiet_since"]), "ready": False, "reason": ""}
             candidates.append(candidate)
             scopes[pid] = (pane, record, scope, roots, info, observation)
-        idle_mib = sum(c["rss_mib"] + c["swap_mib"] for c in candidates if c["action"] == "hibernate")
-        pressure = pressure_level(memory, cfg, state.get("pressure", False), idle_mib)
+
+        pressure_text = "; ".join(pressure)
         for c in candidates:
-            ttl = cfg["resolved_shell_seconds"] if c["action"] == "close-resolved-shell" else cfg["pressure_idle_seconds" if pressure else "idle_seconds"]
-            c["ready"] = (c["idle_seconds"] >= ttl and c["quiet_seconds"] >= cfg["quiet_seconds"]
-                          and (c["action"] == "close-resolved-shell" or c["rss_mib"] + c["swap_mib"] >= cfg["min_reclaim_mib"]))
+            size, idle, quiet = c["rss_mib"] + c["swap_mib"], c["idle_seconds"], c["quiet_seconds"]
+            ready = False
+            if c["action"] == "close-resolved-shell":
+                need = cfg["resolved_shell_seconds"]
+                if idle < need:
+                    why = f"empty shell of a resolved thread, idle {fmt_duration(idle)} of {fmt_duration(need)} before closing"
+                elif quiet < cfg["quiet_seconds"]:
+                    why = f"empty shell of a resolved thread, quiet {fmt_duration(quiet)} of {fmt_duration(cfg['quiet_seconds'])}"
+                else:
+                    ready, why = True, (f"thread resolved and its empty shell pane idle {fmt_duration(idle)} "
+                                        f"(>= {fmt_duration(need)}); closes the pane, keeps the worktree")
+            elif not pressure:
+                why = f"no memory pressure: {headroom(memory, cfg)}"
+            elif idle < cfg["pressure_idle_seconds"]:
+                why = f"memory pressure ({pressure_text}) but agent idle only {fmt_duration(idle)} of {fmt_duration(cfg['pressure_idle_seconds'])}"
+            elif quiet < cfg["quiet_seconds"]:
+                why = f"memory pressure ({pressure_text}) but quiet only {fmt_duration(quiet)} of {fmt_duration(cfg['quiet_seconds'])}"
+            elif size < cfg["min_reclaim_mib"]:
+                why = f"memory pressure ({pressure_text}) but would free only {size:.0f} MiB (< {cfg['min_reclaim_mib']} MiB)"
+            else:
+                ready, why = True, (f"memory pressure: {pressure_text}; agent idle {fmt_duration(idle)}, "
+                                    f"quiet {fmt_duration(quiet)}; frees ~{size:.0f} MiB")
+            c["ready"], c["reason"] = ready, why
+            pane, record = scopes[c["pane_id"]][:2]
+            note(pane, record, "ready" if ready else "watching", why)
         candidates.sort(key=lambda c: (c["ready"], c["action"] == "hibernate", c["rss_mib"] + c["swap_mib"], c["idle_seconds"]), reverse=True)
-        state.update(observations=observations, pressure=bool(pressure))
+        present = {p["pane_id"] for p in snapshot["panes"]}
+        state.update(observations=observations, pressure=bool(pressure),
+                     failures={k: v for k, v in state["failures"].items() if k in present})
         atomic_json(self.state_path, state)
+        hibernated = self.refresh_registry(snapshot)
         report = {"at": now, "enabled": cfg["enabled"], "apply": apply, "server": server,
                   "panes": len(snapshot["panes"]), "agents": len(snapshot.get("agents", [])),
-                  "memory": memory, "idle_agent_mib": round(idle_mib), "pressure": pressure,
-                  "protected": dict(skipped), "candidates": candidates, "actions": []}
+                  "memory": memory, "pressure": pressure, "headroom": headroom(memory, cfg),
+                  "eligible_idle_mib": round(sum(c["rss_mib"] + c["swap_mib"] for c in candidates if c["action"] == "hibernate")),
+                  "protected": dict(protected), "thread_state_errors": thread_errors,
+                  "ignored_settings": ignored_settings(self.config_path),
+                  "candidates": candidates, "actions": [], "hibernated": hibernated, "decisions": []}
         if apply and cfg["enabled"]:
             for c in [c for c in candidates if c["ready"]][:cfg["max_actions_per_cycle"]]:
+                pid = c["pane_id"]
                 try:
-                    result = self.reclaim(c, scopes[c["pane_id"]], cfg, coordinators, server)
-                    report["actions"].append(result)
-                    # Treat ambiguous partial actions as consumed, never retry blindly.
-                    state["observations"].pop(c["pane_id"], None)
+                    result = self.reclaim(c, scopes[pid], cfg, coordinators, server)
+                    state["failures"].pop(pid, None)
+                    self.after_action(result, c, scopes[pid], cfg)
+                    decisions[pid].update(decision="closed" if c["action"] == "close-resolved-shell" else "hibernated")
                 except (GuardError, OSError, ValueError) as exc:
-                    report["actions"].append({"pane_id": c["pane_id"], "error": str(exc)})
-                    # Reobserve a raced/failed candidate before retrying, letting other
-                    # candidates progress instead of starving behind the largest one.
-                    state["observations"].pop(c["pane_id"], None)
+                    count = state["failures"].get(pid, {}).get("count", 0) + 1
+                    permanent = getattr(exc, "permanent", False)
+                    delay = min(cfg["failure_backoff_max_seconds"], cfg["failure_backoff_seconds"] * 2 ** (count - 1))
+                    state["failures"][pid] = {"count": count, "error": str(exc)[:300], "at": now, "next_at": now + delay,
+                                              "permanent": permanent, "signature": signatures[pid]}
+                    result = {"pane_id": pid, "action": c["action"], "project": c["project"], "thread": c["thread"],
+                              "reason": c["reason"], "error": str(exc),
+                              "retry": "not until the pane or thread changes" if permanent else f"in {fmt_duration(delay)}"}
+                    decisions[pid].update(decision="failed")
+                self.audit(result)
+                report["actions"].append(result)
+                # Treat ambiguous partial actions as consumed; reobserve before any retry.
+                state["observations"].pop(pid, None)
+            report["hibernated"] = self.registry()
+        report["decisions"] = list(decisions.values())
         atomic_json(self.state_path, state)
         atomic_json(self.status_path, report)
         return report
+
+    # --- hibernated registry (read by coordinators' tools and dashboards) -------
+
+    @property
+    def registry_path(self):
+        return self.directory / "hibernated.json"
+
+    def registry(self):
+        return read_json(self.registry_path).get("hibernated", {})
+
+    def save_registry(self, entries):
+        atomic_json(self.registry_path, {"updated": time.time(), "socket": self.api.path, "hibernated": entries})
+
+    def refresh_registry(self, snapshot):
+        entries = self.registry()
+        panes = {p["pane_id"]: p for p in snapshot["panes"]}
+        changed = False
+        for pid, entry in list(entries.items()):
+            pane = panes.get(pid)
+            if pane and pane.get("agent"):
+                # Someone resumed it (or reused the pane) outside `guard.py resume`.
+                entries.pop(pid)
+                self.audit({"action": "resumed-elsewhere", "pane_id": pid, "thread": entry.get("thread")})
+                changed = True
+            elif entry.get("pane_present") != bool(pane):
+                entry["pane_present"] = bool(pane)
+                changed = True
+        if changed:
+            self.save_registry(entries)
+        return entries
+
+    def resume_command(self, pane_id):
+        return shlex.join(["python3", str(Path(__file__).resolve()), "resume", "--pane", pane_id, "--socket", self.api.path,
+                           "--config-dir", str(self.config_dir), "--state-dir", str(self.state_dir)])
+
+    def notify(self, cfg, record, event, summary):
+        if not cfg["notify_coordinators"] or not record or not record.get("project"):
+            return None
+        return write_inbox(cfg["projects_root"], record["project"], record.get("id") or "memory-guard", event, summary)
+
+    def after_action(self, result, candidate, evidence, cfg):
+        pane, record = evidence[0], evidence[1]
+        pid = pane["pane_id"]
+        thread = (record or {}).get("id") or "unmanaged agent"
+        result.update(project=(record or {}).get("project"), thread=(record or {}).get("id"), reason=candidate["reason"])
+        if candidate["action"] == "hibernate":
+            args = resume_args(pane["agent"], pane["agent_session"])
+            cwd = pane.get("foreground_cwd") or pane.get("cwd") or (record or {}).get("cwd") or ""
+            entry = {"pane_id": pid, "project": result["project"], "thread": result["thread"], "agent": pane["agent"],
+                     "session_id": pane["agent_session"]["value"], "cwd": cwd, "status": result.get("status"),
+                     "reason": candidate["reason"], "checkpoint": result["checkpoint"], "hibernated_at": time.time(),
+                     "resume_command": self.resume_command(pid),
+                     "native_resume_command": native_resume_command(pane["agent"], args, cwd), "pane_present": True}
+            entries = self.registry()
+            entries[pid] = entry
+            self.save_registry(entries)
+            event = "hibernated by Memory Guard"
+            summary = (f"{thread} ({pane['agent']} in pane {pid}) was hibernated by Memory Guard "
+                       f"({result.get('status')}). Reason: {candidate['reason']}. Checkpoint: {result['checkpoint']}. "
+                       f"Resume: {entry['resume_command']} . If the pane is gone: {entry['native_resume_command']}")
+        else:
+            event = "pane closed by Memory Guard"
+            summary = (f"{thread}: its empty shell pane {pid} was closed by Memory Guard. Reason: {candidate['reason']}. "
+                       f"Checkpoint with recent scrollback: {result['checkpoint']}")
+        try:
+            result["notified"] = self.notify(cfg, record, event, summary)
+        except (GuardError, OSError) as exc:
+            result["notify_error"] = str(exc)
 
     def reclaim(self, candidate, evidence, cfg, coordinators, server):
         pane, record, scope, roots, info, observation = evidence
@@ -518,6 +921,12 @@ class Guard:
             reason = protection(current, record, latest_coordinators, latest_cfg)
             if reason:
                 raise GuardError(reason)
+            if record:
+                # The coordinator or user may have just prompted or reviewed the thread.
+                live = thread_states(latest_cfg, {record["project"]})[0].get((record["project"], record.get("id")))
+                hold = thread_hold(record, live, time.time(), latest_cfg)[1]
+                if hold:
+                    raise GuardError(hold)
         elif not record or record.get("status") != "resolved":
             raise GuardError("Thread is no longer resolved")
         latest_info = self.api.call("pane.process_info", pane_id=pid)["process_info"]
@@ -539,49 +948,72 @@ class Guard:
         if delta_ticks > allowed_ticks:
             raise GuardError("Processes became CPU-active during final validation")
         checkpoint = self.checkpoint(candidate, pane, record, scope, server, cfg)
-        # Check again after checkpoint I/O and reading terminal output.
-        current = self.observe_pane(self.api.call("pane.get", pane_id=pid)["pane"])
-        if current.get("focused") or identity(current) != identity(pane) or activity(current) != activity(pane):
-            raise GuardError("Pane changed while checkpointing; checkpoint retained")
-        if candidate["action"] == "close-resolved-shell":
-            # Never close a shell with even one background descendant.
-            if len(descendants(info["shell_pid"], process_table())) != 1:
-                raise GuardError("Shell acquired a background job")
-            self.api.call("pane.close", pane_id=pid)
-            result = {"pane_id": pid, "action": candidate["action"], "checkpoint": str(checkpoint)}
-        else:
-            def validate_before_signal():
-                final = self.observe_pane(self.api.call("pane.get", pane_id=pid)["pane"])
-                if final.get("focused") or identity(final) != identity(pane) or activity(final) != activity(pane):
-                    raise GuardError("Pane changed before signaling")
-                if not config_load(self.config_path)["enabled"]:
-                    raise GuardError("Automatic reclamation is paused")
-            result = terminate_scope(scope, roots, validate=validate_before_signal)
-            result.update(pane_id=pid, action="hibernate", checkpoint=str(checkpoint),
-                          estimated_rss_mib=candidate["rss_mib"], estimated_swap_mib=candidate["swap_mib"])
-        saved = read_json(checkpoint)
-        saved["outcome"] = result
-        atomic_json(checkpoint, saved)
-        self.audit(result)
+        try:
+            # Check again after checkpoint I/O and reading terminal output.
+            current = self.observe_pane(self.api.call("pane.get", pane_id=pid)["pane"])
+            if current.get("focused") or identity(current) != identity(pane) or activity(current) != activity(pane):
+                raise GuardError("Pane changed while checkpointing")
+            if candidate["action"] == "close-resolved-shell":
+                # Never close a shell with even one background descendant.
+                if len(descendants(info["shell_pid"], process_table())) != 1:
+                    raise GuardError("Shell acquired a background job")
+                self.api.call("pane.close", pane_id=pid)
+                result = {"pane_id": pid, "action": candidate["action"], "status": "closed", "checkpoint": str(checkpoint)}
+            else:
+                def validate_before_signal():
+                    final = self.observe_pane(self.api.call("pane.get", pane_id=pid)["pane"])
+                    if final.get("focused") or identity(final) != identity(pane) or activity(final) != activity(pane):
+                        raise GuardError("Pane changed before signaling")
+                    if not config_load(self.config_path)["enabled"]:
+                        raise GuardError("Automatic reclamation is paused")
+                result = terminate_scope(scope, roots, validate=validate_before_signal)
+                result.update(pane_id=pid, action="hibernate", checkpoint=str(checkpoint),
+                              estimated_rss_mib=candidate["rss_mib"], estimated_swap_mib=candidate["swap_mib"])
+        except (GuardError, OSError, ValueError) as exc:
+            # Nothing was signaled or closed: record the aborted attempt in the same
+            # checkpoint, which the next attempt reuses instead of adding another.
+            self.mark_checkpoint(checkpoint, {"action": candidate["action"], "status": "aborted", "error": str(exc)})
+            raise
+        result["reason"] = candidate["reason"]
+        self.mark_checkpoint(checkpoint, result)
         return result
+
+    def mark_checkpoint(self, path, outcome):
+        saved = read_json(path)
+        saved["outcome"] = outcome
+        atomic_json(path, saved)
 
     def checkpoint(self, candidate, pane, record, scope, server, cfg):
         directory = self.directory / "checkpoints"
         directory.mkdir(exist_ok=True, mode=0o700)
-        files = list(directory.glob("*.json"))
-        if len(files) >= cfg["max_checkpoints"] or sum(f.stat().st_size for f in files) >= cfg["checkpoint_limit_mib"] * MIB:
-            raise GuardError("Checkpoint budget reached; preserve existing recovery records and stop reclaiming")
+        files = sorted(directory.glob("*.json"), reverse=True)
+        key = checkpoint_key({"pane": pane, "decision": candidate})
+        reuse = None
+        for file in files:
+            try:
+                previous = json.loads(file.read_text())
+            except (OSError, ValueError):
+                continue
+            if checkpoint_key(previous) == key:
+                # Reuse the newest checkpoint of this same occupant when its attempt changed nothing.
+                if (previous.get("outcome") or {}).get("status") == "aborted":
+                    reuse = file
+                break
+        if not reuse and (len(files) >= cfg["max_checkpoints"] or sum(f.stat().st_size for f in files) >= cfg["checkpoint_limit_mib"] * MIB):
+            raise GuardError("Checkpoint budget reached; preserve existing recovery records and stop reclaiming", permanent=True)
         # Visible reads are passive. Asking an idle CLI for application-owned
         # history can scroll its UI and itself invalidate the quiet observation.
         output = self.api.call("pane.read", pane_id=pane["pane_id"], source="visible", lines=200, strip_ansi=True)
         data = {"at": time.time(), "server": server, "socket": self.api.path,
-                "pane": pane, "thread": record, "terminal_output": output,
+                "pane": pane, "thread": record, "terminal_output": output, "reason": candidate["reason"],
                 "processes": [dataclasses.asdict(p) for p in scope.values()], "decision": candidate}
         if candidate["action"] == "hibernate":
             data["resume_args"] = resume_args(pane["agent"], pane["agent_session"])
-        if sum(f.stat().st_size for f in files) + len(json.dumps(data, ensure_ascii=False).encode()) > cfg["checkpoint_limit_mib"] * MIB:
-            raise GuardError("Checkpoint budget would be exceeded; automatic action stopped")
-        path = directory / f"{time.time_ns()}-{pane['pane_id'].replace(':', '-')}.json"
+            data["resume_command"] = self.resume_command(pane["pane_id"])
+        existing = sum(f.stat().st_size for f in files if f != reuse)
+        if existing + len(json.dumps(data, ensure_ascii=False).encode()) > cfg["checkpoint_limit_mib"] * MIB:
+            raise GuardError("Checkpoint budget would be exceeded; automatic action stopped", permanent=True)
+        path = reuse or directory / f"{time.time_ns()}-{pane['pane_id'].replace(':', '-')}.json"
         atomic_json(path, data)
         return path
 
@@ -592,10 +1024,22 @@ class Guard:
         with path.open("a") as out:
             out.write(json.dumps({"at": time.time(), **result}) + "\n")
 
-    def resume(self, pane_id):
+    def prune(self, apply=False):
         with self.locked():
-            choices = sorted((self.directory / "checkpoints").glob("*.json"), reverse=True)
-            saved = next((read_json(p) for p in choices if read_json(p).get("pane", {}).get("pane_id") == pane_id and read_json(p).get("outcome", {}).get("action") == "hibernate"), None)
+            plan = prune_checkpoints(self.directory / "checkpoints", apply)
+            if apply and plan["remove"]:
+                self.audit({"action": "prune-checkpoints", "removed": len(plan["remove"])})
+            return plan
+
+    def resume(self, pane_id, verify_seconds=15):
+        with self.locked():
+            path, saved = None, None
+            for choice in sorted((self.directory / "checkpoints").glob("*.json"), reverse=True):
+                data = read_json(choice)
+                if data.get("pane", {}).get("pane_id") == pane_id and data.get("outcome", {}).get("action") == "hibernate" \
+                        and data.get("outcome", {}).get("status") != "aborted":
+                    path, saved = choice, data
+                    break
             if not saved:
                 raise GuardError("No successful hibernation checkpoint for this pane")
             pane = self.api.call("pane.get", pane_id=pane_id)["pane"]
@@ -616,10 +1060,48 @@ class Guard:
             # Native CLI validates prompt readiness and refuses a busy pane.
             kind = original["agent"]
             args = resume_args(kind, original["agent_session"])
+            session_id = original["agent_session"]["value"]
             name = original.get("name") or f"mg-{hashlib.sha256(pane_id.encode()).hexdigest()[:12]}"
-            result = self.api.call("agent.start", pane_id=pane_id, kind=kind, name=name, args=args, timeout_ms=8000)
-            self.audit({"action": "resume", "pane_id": pane_id})
+            started = self.api.call("agent.start", pane_id=pane_id, kind=kind, name=name, args=args, timeout_ms=8000)
+            verified = self.verify_session(pane_id, kind, session_id, verify_seconds)
+            result = {"pane_id": pane_id, "agent": kind, "session_id": session_id, "session_verified": verified,
+                      "args": args, "started": started, "checkpoint": str(path)}
+            saved["resumed"] = {"at": time.time(), "session_verified": verified}
+            atomic_json(path, saved)
+            entries = self.registry()
+            if entries.pop(pane_id, None) is not None:
+                self.save_registry(entries)
+            record = saved.get("thread") or {}
+            thread = record.get("id") or "unmanaged agent"
+            check = ("native session verified" if verified
+                     else "herdr has not yet confirmed the native session id; check the pane")
+            try:
+                result["notified"] = self.notify(config_load(self.config_path), record, "resumed by Memory Guard",
+                                                 f"{thread} ({kind} in pane {pane_id}) was resumed with {shlex.join([kind, *args])}; {check}.")
+            except (GuardError, OSError) as exc:
+                result["notify_error"] = str(exc)
+            self.audit({"action": "resume", "pane_id": pane_id, "thread": record.get("id"), "session_verified": verified})
             return result
+
+    def verify_session(self, pane_id, kind, session_id, seconds):
+        """Confirm herdr sees the restarted agent on the saved native session."""
+        deadline = time.monotonic() + seconds
+        while True:
+            try:
+                agent = self.api.call("agent.get", target=pane_id)["agent"]
+                session = agent.get("agent_session") or {}
+                if agent.get("agent") == kind and session.get("value") == session_id:
+                    return True
+            except GuardError:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
+
+
+def failure_signature(pane, record, live):
+    """What must change before a failed action is worth trying again."""
+    return [identity(pane), pane.get("agent_status"), (record or {}).get("status"), (live or {}).get("group_token")]
 
 
 def terminate_scope(scope, roots, validate=None):
@@ -686,12 +1168,13 @@ def service(guard, action):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["once", "run", "start", "stop", "enable", "pause", "status", "protect", "unprotect", "resume"])
+    parser.add_argument("command", choices=["once", "run", "start", "stop", "enable", "pause", "status", "protect", "unprotect", "resume", "prune-checkpoints"])
     parser.add_argument("--socket", default=os.environ.get("HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock"))
     parser.add_argument("--config-dir", default=os.environ.get("HERDR_PLUGIN_CONFIG_DIR", f"~/.config/herdr/plugins/config/{PLUGIN}"))
     parser.add_argument("--state-dir", default=os.environ.get("HERDR_PLUGIN_STATE_DIR", f"~/.local/state/herdr-memory-guard"))
     parser.add_argument("--pane", default=os.environ.get("HERDR_PANE_ID"))
     parser.add_argument("--apply", action="store_true", help="once only: enforce if config.enabled is true")
+    parser.add_argument("--json", action="store_true", help="once only: print the full JSON report instead of the per-pane table")
     args = parser.parse_args()
     os.umask(0o077)
     guard = Guard(API(Path(args.socket).expanduser()), Path(args.config_dir).expanduser().resolve(), Path(args.state_dir).expanduser().resolve())
@@ -706,7 +1189,7 @@ def main():
                 cfg["protected_panes"] = sorted(panes)
             else:
                 cfg["enabled"] = args.command == "enable"
-            atomic_json(guard.config_path, cfg)
+            atomic_json(guard.config_path, cfg)  # also drops deprecated settings
         print(json.dumps({"enabled": cfg["enabled"], "protected_panes": cfg["protected_panes"]}))
     elif args.command in {"start", "stop"}:
         print(json.dumps(service(guard, args.command)))
@@ -717,7 +1200,11 @@ def main():
             raise GuardError("Provide --pane or invoke Resume in a hibernated pane")
         print(json.dumps(guard.resume(args.pane)))
     elif args.command == "once":
-        print(json.dumps(guard.cycle(args.apply), indent=2))
+        report = guard.cycle(args.apply)
+        print(json.dumps(report, indent=2) if args.json else render(report))
+    elif args.command == "prune-checkpoints":
+        # Dry run unless --apply; never removes successful hibernation records.
+        print(json.dumps(guard.prune(args.apply), indent=2))
     else:
         # One daemon per session; one cycle lock also excludes manual invocations.
         with (guard.directory / "daemon.lock").open("a") as lock:
@@ -725,13 +1212,19 @@ def main():
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return
+            with contextlib.suppress(GuardError, OSError, ValueError):
+                removed = guard.prune(apply=True)["remove"]
+                if removed:
+                    print(f"memory-guard: pruned {len(removed)} duplicate checkpoints of attempts that changed nothing", flush=True)
             while True:
                 try:
                     if not plugin_enabled(guard.api):
                         return
                     report = guard.cycle(apply=True)
-                    if report["actions"]:
-                        print(json.dumps({"actions": report["actions"]}), flush=True)
+                    for a in report["actions"]:
+                        who = "/".join(x for x in (a.get("project"), a.get("thread")) if x) or "unmanaged"
+                        outcome = f"FAILED: {a['error']} (retry {a['retry']})" if "error" in a else a.get("status", "done")
+                        print(f"memory-guard: {a['action']} {a['pane_id']} ({who}): {outcome}. Reason: {a.get('reason')}", flush=True)
                     interval = config_load(guard.config_path)["interval_seconds"]
                 except Exception as exc:
                     # Fail closed; preserve the last good state and retry without any cleanup.

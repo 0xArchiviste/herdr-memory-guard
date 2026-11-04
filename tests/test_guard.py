@@ -92,6 +92,45 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(g.pressure_level(memory, g.DEFAULTS, False), [])
 
 
+    def test_scope_excludes_shell_unrelated_process_and_background_sibling(self):
+        table = {100: proc(100, 1, 100, "bash"), 101: proc(101, 100, 101, "claude"),
+                 102: proc(102, 101, 102, "node"), 103: proc(103, 100, 103, "server"),
+                 104: proc(104, 1, 101, "claude")}
+        scope, roots = g.process_scope({"shell_pid": 100, "foreground_process_group_id": 101}, table, "claude")
+        self.assertEqual(set(scope), {101, 102})
+        self.assertEqual(roots, [101])
+
+    def test_scope_refuses_shell_foreground_and_wrong_agent(self):
+        table = {100: proc(100, 1, 100, "bash"), 101: proc(101, 100, 101, "vim")}
+        for fg in [100, 101, 999]:
+            self.assertEqual(g.process_scope({"shell_pid": 100, "foreground_process_group_id": fg}, table, "claude"), ({}, []))
+
+    def test_invalid_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.json"
+            for value in [{"enabled": "false"}, {"quiet_seconds": 0}, {"oops": True}, {"max_actions_per_cycle": 1.5}, {"available_percent": 101}, {"pressure_idle_seconds": float("nan")}, {"protected_panes": [123]}]:
+                g.atomic_json(path, value)
+                with self.assertRaises(g.GuardError):
+                    g.config_load(path)
+
+    def test_atomic_files_are_private(self):
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / "checkpoint.json"
+            g.atomic_json(file, {"private": "session"})
+            self.assertEqual(file.stat().st_mode & 0o777, 0o600)
+
+    def test_project_binding_is_session_scoped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "demo"
+            (project / "threads").mkdir(parents=True)
+            g.atomic_json(project / ".state/coordinator.json", {"socket": "/one.sock", "pane_id": "w1:p1"})
+            (project / "threads/t-0001.toml").write_text('pane_id = "w1:p2"\nstatus = "open"\n')
+            self.assertFalse(g.project_records(temp, "/two.sock")[0])
+            records, coords = g.project_records(temp, "/one.sock")
+            self.assertIn("w1:p2", records)
+            self.assertEqual(coords, {"w1:p1": "demo"})
+
+
 class ThreadHoldTests(unittest.TestCase):
     record = {"project": "demo", "id": "t-0001", "status": "open", "report_hash": "", "acked_report_hash": "",
               "pr_state": "", "last_state_change": "2000-01-01T00:00:00Z", "launched_at": "2000-01-01T00:00:00Z"}
@@ -187,44 +226,6 @@ class InboxTests(unittest.TestCase):
             with self.assertRaises(g.GuardError):
                 g.write_inbox(temp, "missing", "t-0001", "x", "y")
 
-    def test_scope_excludes_shell_unrelated_process_and_background_sibling(self):
-        table = {100: proc(100, 1, 100, "bash"), 101: proc(101, 100, 101, "claude"),
-                 102: proc(102, 101, 102, "node"), 103: proc(103, 100, 103, "server"),
-                 104: proc(104, 1, 101, "claude")}
-        scope, roots = g.process_scope({"shell_pid": 100, "foreground_process_group_id": 101}, table, "claude")
-        self.assertEqual(set(scope), {101, 102})
-        self.assertEqual(roots, [101])
-
-    def test_scope_refuses_shell_foreground_and_wrong_agent(self):
-        table = {100: proc(100, 1, 100, "bash"), 101: proc(101, 100, 101, "vim")}
-        for fg in [100, 101, 999]:
-            self.assertEqual(g.process_scope({"shell_pid": 100, "foreground_process_group_id": fg}, table, "claude"), ({}, []))
-
-    def test_invalid_config_fails_closed(self):
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "config.json"
-            for value in [{"enabled": "false"}, {"quiet_seconds": 0}, {"oops": True}, {"max_actions_per_cycle": 1.5}, {"available_percent": 101}, {"idle_budget_mib": float("nan")}, {"protected_panes": [123]}]:
-                g.atomic_json(path, value)
-                with self.assertRaises(g.GuardError):
-                    g.config_load(path)
-
-    def test_atomic_files_are_private(self):
-        with tempfile.TemporaryDirectory() as temp:
-            file = Path(temp) / "checkpoint.json"
-            g.atomic_json(file, {"private": "session"})
-            self.assertEqual(file.stat().st_mode & 0o777, 0o600)
-
-    def test_project_binding_is_session_scoped(self):
-        with tempfile.TemporaryDirectory() as temp:
-            project = Path(temp) / "demo"
-            (project / "threads").mkdir(parents=True)
-            g.atomic_json(project / ".state/coordinator.json", {"socket": "/one.sock", "pane_id": "w1:p1"})
-            (project / "threads/t-0001.toml").write_text('pane_id = "w1:p2"\nstatus = "open"\n')
-            self.assertFalse(g.project_records(temp, "/two.sock")[0])
-            records, coords = g.project_records(temp, "/one.sock")
-            self.assertIn("w1:p2", records)
-            self.assertEqual(coords, {"w1:p1"})
-
 
 class CycleTests(unittest.TestCase):
     def setUp(self):
@@ -243,7 +244,7 @@ class CycleTests(unittest.TestCase):
         self.projects = Path(self.temp.name) / "projects"
         (self.projects / "demo/.state").mkdir(parents=True)
         (self.projects / "demo/PROJECT.md").write_text("+++\n+++\n")
-        self.cfg = g.DEFAULTS | {"enabled": True, "quiet_seconds": 30, "pressure_idle_seconds": 60,
+        self.cfg = g.DEFAULTS | {"enabled": True, "quiet_seconds": 30, "pressure_idle_seconds": 60, "recent_work_seconds": 60,
                                  "projects_root": str(self.projects)}
         g.atomic_json(self.guard.config_path, self.cfg)
         # Default: genuine Linux memory pressure, so the other rules are what is under test.
@@ -304,10 +305,10 @@ class CycleTests(unittest.TestCase):
         with patch.object(g, "terminate_scope", return_value={"status": "hibernated"}):
             report = self.cycle(1031, True)
         action = report["actions"][0]
-        self.assertIn("MemAvailable 5%", action["reason"])
-        self.assertIn("below 20%", action["reason"])
+        # The first cycle entered pressure, so the recovery threshold (25%) now applies.
+        self.assertIn("MemAvailable 5% (4000 MiB) is below 25% (recovery threshold)", action["reason"])
         audit = [json.loads(l) for l in (self.guard.directory / "audit.jsonl").read_text().splitlines()]
-        self.assertIn("below 20%", audit[-1]["reason"])
+        self.assertIn("below 25%", audit[-1]["reason"])
         self.assertEqual(g.read_json(action["checkpoint"])["reason"], action["reason"])
 
     # --- Rule: never stop coordinators, waiting threads, recent work -----------
@@ -340,7 +341,7 @@ class CycleTests(unittest.TestCase):
         self.assertEqual(self.decision(report)["decision"], "protected")
 
     def test_recently_worked_thread_is_protected(self):
-        self.record["last_state_change"] = "1970-01-01T00:16:00Z"  # 960s
+        self.record["last_state_change"] = "1970-01-01T00:16:40Z"  # t=1000
         self.cycle(1000)
         with patch.object(g, "terminate_scope") as terminate:
             report = self.cycle(1031, True)
@@ -422,7 +423,7 @@ class CycleTests(unittest.TestCase):
         summary = items[0]["summary"]
         self.assertEqual(items[0]["subject"], "t-0001")
         self.assertIn("t-0001", summary)
-        self.assertIn("below 20%", summary)
+        self.assertIn("MemAvailable 5% (4000 MiB) is below 25%", summary)
         self.assertIn(action["checkpoint"], summary)
         self.assertIn("resume --pane w1:p2", summary)
         self.assertIn("claude --resume 12345678-abcd-1234", summary)
